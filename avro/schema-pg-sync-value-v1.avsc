@@ -1,0 +1,36 @@
+{
+  "connect.name": "sync",
+  "fields": [
+    {
+      "name": "id",
+      "type": "int"
+    },
+    {
+      "name": "timestamp",
+      "type": {
+        "connect.name": "org.apache.kafka.connect.data.Timestamp",
+        "connect.version": 1,
+        "logicalType": "timestamp-millis",
+        "type": "long"
+      }
+    },
+    {
+      "default": null,
+      "name": "q",
+      "type": [
+        "null",
+        "string"
+      ]
+    },
+    {
+      "default": null,
+      "name": "type",
+      "type": [
+        "null",
+        "string"
+      ]
+    }
+  ],
+  "name": "sync",
+  "type": "record"
+}

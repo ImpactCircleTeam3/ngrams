@@ -1,12 +1,17 @@
 import nltk
 import os
+import io
 import psycopg2
 import functools
 import operator
 import re
 import logging
 import sys
+import uuid
 
+import avro.schema
+from avro.io import DatumReader, BinaryDecoder
+from time import sleep
 from typing import List, Optional
 from psycopg2.extras import execute_values
 from nltk.corpus import stopwords
@@ -15,6 +20,8 @@ from textblob import Word
 from dataclasses import dataclass
 from datetime import datetime
 from dotenv import load_dotenv
+from confluent_kafka import Consumer
+
 
 load_dotenv()
 
@@ -47,6 +54,18 @@ class Settings:
             "database": os.getenv("DB_NAME")
         }
 
+    @staticmethod
+    def get_kafka_consumer_kwargs() -> dict:
+        return {
+            "bootstrap.servers": os.getenv("KAFKA_CLUSTER_SERVER"),
+            "group.id": f"ngrams-{uuid.uuid4().hex[:6]}",
+            'auto.offset.reset': 'earliest',
+            'security.protocol': 'SASL_SSL',
+            'sasl.mechanisms': 'PLAIN',
+            'sasl.username': os.getenv("KAFKA_CLUSTER_API_KEY"),
+            'sasl.password': os.getenv("KAFKA_CLUSTER_API_SECRET")
+        }
+
 
 @dataclass
 class Tweet:
@@ -71,8 +90,16 @@ class NGram:
     dimension: int
     sequence: List[str]
     frequency: int
-    hashtag: str
-    hashtag_is_in_ngram: bool
+    q: str
+    type: str
+
+
+@dataclass
+class SyncJob:
+    id: int
+    timestamp: datetime
+    q: str
+    type: str
 
 
 class DB:
@@ -93,26 +120,93 @@ class DB:
         self.conn.autocommit = True
 
 
+class KafkaConnector:
+    kafka_connector: Optional["KafkaConnector"] = None
+
+    parser = avro.schema.parse(open(os.path.join(Settings.BASE_DIR, "avro", "schema-pg-sync-value-v1.avsc")).read())
+
+    sync_reader = DatumReader(
+        avro.schema.parse(
+            open(os.path.join(Settings.BASE_DIR, "avro", "schema-pg-sync-value-v1.avsc")).read()
+        )
+    )
+
+    @classmethod
+    def get_instance(cls) -> "KafkaConnector":
+        if not cls.kafka_connector:
+            cls.kafka_connector = cls()
+        return cls.kafka_connector
+
+    def __init__(self):
+        self.consumer = Consumer(
+            Settings.get_kafka_consumer_kwargs()
+        )
+
+    @staticmethod
+    def decode(reader: DatumReader, message: bytes) -> SyncJob:
+        message_bytes = io.BytesIO(message)
+
+        # LMAA!!! Ref: https://newbedev.com/how-to-decode-deserialize-avro-with-python-from-kafka
+        # It's a crap!
+        message_bytes.seek(5)
+
+        decoder = BinaryDecoder(message_bytes)
+        value = reader.read(decoder)
+        return SyncJob(**value)
+
+
 class ORM:
     db: DB = DB.get_instance().DB
 
     @classmethod
-    def fetch_tweets_bodies_by_hashtag(cls, hashtag: str) -> List[Tweet]:
-        logger.info("Start Fetching Tweets from Postgres")
-        tweets = []
-        for i in range(1, 7):
-            sql = f"SELECT {','.join(Tweet.__annotations__.keys())} FROM tweet WHERE hashtags[%s]=%s AND language_code=%s"
-            cls.db.cur.execute(sql, (i, hashtag, "en", ))
-            tweets += [Tweet(*row) for row in cls.db.cur.fetchall()]
+    def _clean_tweets(cls, tweets: List[Tweet]) -> List[Tweet]:
+        logger.info("Start cleaning Tweets")
         taken_ids = []
+        processed_texts = []
         unique_tweets = []
         for tweet in tweets:
-            if tweet.id in taken_ids:
+            if tweet.id in taken_ids or tweet.text in processed_texts:
                 continue
+            if len(tweet.hashtags) > 7:
+                # TODO - make threshold to env
+                logger.info("To Many Hashtag References. TODO: Make this as an env var")
+                continue
+            processed_texts.append(tweet.text)
             unique_tweets.append(tweet)
             taken_ids.append(tweet.id)
+        return unique_tweets
+
+    @classmethod
+    def fetch_tweets_bodies_by_hashtag(cls, hashtag: str) -> List[Tweet]:
+        logger.info("Start Fetching Tweets from Postgres by Hashtag")
+        tweets = []
+        # TODO improve Range
+        for i in range(1, 9):
+            sql = f"SELECT {','.join(Tweet.__annotations__.keys())} FROM tweet WHERE hashtags[%s]=%s AND language_code=%s"
+            try:
+                tweets += [Tweet(*row) for row in cls.db.cur.fetchall()]
+            except psycopg2.ProgrammingError as e:
+                logger.warning(str(e))
+            cls.db.cur.execute(sql, (i, hashtag, "en", ))
+        unique_tweets = cls._clean_tweets(tweets)
         logger.info(f"Number of fetched tweets: {len(unique_tweets)}")
         return unique_tweets
+
+    @classmethod
+    def fetch_tweets_bodies_by_author(cls, author: str) -> List[Tweet]:
+        logger.info("Start Fetching Tweets from Postgres By Author")
+        sql = f"SELECT {','.join(Tweet.__annotations__.keys())} FROM tweet WHERE author=%s AND language_code=%s"
+        cls.db.cur.execute(sql, (author, "en",))
+        tweets = [Tweet(*row) for row in cls.db.cur.fetchall()]
+        unique_tweets = cls._clean_tweets(tweets)
+        logger.info(f"Number of fetched tweets: {len(unique_tweets)}")
+        return unique_tweets
+
+    @classmethod
+    def get_tweet_authors(cls):
+        sql = "SELECT DISTINCT(author) FROM tweet"
+        cls.db.cur.execute(sql)
+        return [e[0] for e in cls.db.cur.fetchall()]
 
     @classmethod
     def insert_ngrams(cls, ngrams: List[NGram]):
@@ -121,10 +215,16 @@ class ORM:
         execute_values(cls.db.cur, sql, [tuple(ngram.__dict__.values()) for ngram in ngrams])
 
     @classmethod
-    def remove_ngrams(cls, dimension: int, hashtag: str):
-        logger.info(f"Remove ngrams for hashtag {hashtag} with dimension {dimension}")
-        sql = "DELETE FROM ngram WHERE dimension=%s and hashtag=%s"
-        cls.db.cur.execute(sql, (dimension, hashtag, ))
+    def remove_ngrams(cls, dimension: int, q: str, type: str):
+        logger.info(f"Remove ngrams for Type {type} q {q} with dimension {dimension}")
+        sql = "DELETE FROM ngram WHERE dimension=%s AND q=%s AND type=%s"
+        cls.db.cur.execute(sql, (dimension, q, type, ))
+
+    @classmethod
+    def get_all_hashtags(cls) -> List[str]:
+        sql = "SELECT hashtag FROM hashtag"
+        cls.db.cur.execute(sql)
+        return [e[0] for e in cls.db.cur.fetchall()]
 
 
 def _clean_text(text: str):
@@ -142,7 +242,7 @@ def _clean_text(text: str):
     return " ".join(words)
 
 
-def get_2_gram_df(corpus: List[str], hashtag: str) -> List[NGram]:
+def get_2_gram_df(corpus: List[str], q: str, type: str) -> List[NGram]:
     logger.info("Start creating bigrams")
 
     def right_types_2_gram(ngram):
@@ -173,14 +273,13 @@ def get_2_gram_df(corpus: List[str], hashtag: str) -> List[NGram]:
     bigram_freq = list(bigram_finder.ngram_fd.items())
 
     logger.info("Start Filtering Bigrams TODO: Change threshold to env Variable.")
-    lemmatized_hashtag = Word(hashtag.lower()).lemmatize()
     return [
         NGram(
             dimension=2,
-            hashtag=hashtag,
+            q=q,
             frequency=bigram[1],
             sequence=list(bigram[0]),
-            hashtag_is_in_ngram=lemmatized_hashtag in bigram[0],
+            type=type
         ) for bigram in bigram_freq
         if right_types_2_gram(bigram[0]) and bigram[1] > 3      # TODO change to env Variable
     ]
@@ -200,21 +299,21 @@ def get_hashtags_from_tweets(tweets: List[Tweet]) -> List[str]:
     return hashtag_list
 
 
-def ngram_runner(tweets: List[Tweet], hashtag: str):
+def ngram_runner(tweets: List[Tweet], q: str, type: str):
     tweet_bodies = [tweet.text for tweet in tweets]
-    bigrams = get_2_gram_df(tweet_bodies, hashtag)
-    ORM.remove_ngrams(dimension=2, hashtag=hashtag)
+    bigrams = get_2_gram_df(tweet_bodies, q=q, type=type)
+    ORM.remove_ngrams(dimension=2, q=q, type=type)
     ORM.insert_ngrams(bigrams)
 
 
-def runner():
-    hashtag = 'globalwarming'
+def runner(sync_job: SyncJob):
+    hashtag = sync_job.q
     logger.info(f"Start creating ngrams for hashtag {hashtag} and all references")
     tweets = ORM.fetch_tweets_bodies_by_hashtag(hashtag)
     hashtags_in_tweets = get_hashtags_from_tweets(tweets)
     logger.info(f"{len(hashtag) - 1} references found")
     if len(tweets) >= 50:
-        ngram_runner(tweets, hashtag)
+        ngram_runner(tweets, q=hashtag, type="hashtag")
     else:
         logger.info(f"Not enough text bodies for creating valuable ngrams ({len(tweets)})")
 
@@ -224,10 +323,53 @@ def runner():
             continue
         tweets = ORM.fetch_tweets_bodies_by_hashtag(hashtag_)
         if len(tweets) >= 50:
-            ngram_runner(tweets, hashtag_)
+            ngram_runner(tweets, q=hashtag_, type="hashtag")
         else:
             logger.info(f"Not enough text bodies for creating valuable ngrams ({len(tweets)})")
 
 
+def _initial_runner():
+    hashtags = ORM.get_all_hashtags()
+    for hashtag in hashtags:
+        tweets = ORM.fetch_tweets_bodies_by_hashtag(hashtag)
+        if len(tweets) >= 15:
+            ngram_runner(tweets, q=hashtag, type="hashtag")
+        else:
+            logger.info(f"Not enough text bodies for creating valuable ngrams ({len(tweets)})")
+
+    authors = ORM.get_tweet_authors()
+    for author in authors:
+        tweets = ORM.fetch_tweets_bodies_by_author(author)
+        if len(tweets) >= 10:
+            ngram_runner(tweets, q=author, type="author")
+        else:
+            logger.info(f"Not enough text bodies for creating valuable ngrams ({len(tweets)})")
+
+
+def event_listener():
+    consumer = KafkaConnector.get_instance().kafka_connector.consumer
+    consumer.subscribe(["pg-sync"])
+    while True:
+        msg = consumer.poll(timeout=1)
+        if msg is None:
+            logger.info("No Message Received. Wait for polling.")
+            continue
+        elif msg.error():
+            logger.error(msg.error())
+        else:
+            sync_job = KafkaConnector.decode(
+                reader=KafkaConnector.sync_reader,
+                message=msg.value()
+            )
+            logger.info(f"Job w. id {sync_job.id} received")
+            runner(sync_job)
+
+
 if __name__ == "__main__":
-    runner()
+    while True:
+        try:
+            event_listener()
+        except Exception as e:
+            logger.exception(str(e))
+        logger.info("Wait for reconnection")
+        sleep(60)

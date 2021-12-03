@@ -1,0 +1,9 @@
+avro==1.11.0
+confluent-kafka==1.7.0
+gensim==4.1.2
+nltk==3.6.5
+psycopg2-binary==2.9.2
+pyLDAvis==3.3.1
+python-dotenv==0.19.2
+requests==2.26.0
+textblob==0.17.1
