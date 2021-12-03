@@ -1,3 +1,5 @@
+ECHO "Fun"
+
 docker stop ngram
 
 git pull origin master
