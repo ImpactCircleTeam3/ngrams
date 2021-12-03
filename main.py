@@ -254,10 +254,7 @@ def get_2_gram_df(corpus: List[str], q: str, type: str) -> List[NGram]:
         acceptable_types = ('JJ', 'JJR', 'JJS', 'NN', 'NNS', 'NNP', 'NNPS')
         second_type = ('NN', 'NNS', 'NNP', 'NNPS')
         tags = nltk.pos_tag(ngram)
-        if tags[0][1] in acceptable_types and tags[1][1] in second_type:
-            return True
-        else:
-            return False
+        return tags[0][1] in acceptable_types and tags[1][1] in second_type
 
     logger.debug("Cleaning corpus")
     cleaned_tweets = [_clean_text(tweet) for tweet in corpus]
@@ -285,6 +282,48 @@ def get_2_gram_df(corpus: List[str], q: str, type: str) -> List[NGram]:
     ]
 
 
+def get_3_gram_df(corpus: List[str], q: str, type: str) -> List[NGram]:
+    # TODO - this method is redundant and could be put together with 2 gram
+    #        the only difference here is the filter method and dimension
+    logger.info("Start creating trigrams")
+
+    def right_types_3_gram(ngram):
+        if '-pron-' in ngram or 't' in ngram:
+            return False
+        for word in ngram:
+            if word in STOPWORDS or word.isspace():
+                return False
+        first_type = ('JJ', 'JJR', 'JJS', 'NN', 'NNS', 'NNP', 'NNPS')
+        third_type = ('JJ', 'JJR', 'JJS', 'NN', 'NNS', 'NNP', 'NNPS')
+        tags = nltk.pos_tag(ngram)
+        return tags[0][1] in first_type and tags[2][1] in third_type
+
+    logger.debug("Cleaning corpus")
+    cleaned_tweets = [_clean_text(tweet) for tweet in corpus]
+
+    logger.debug("Tokenize corpus")
+    tokens = [word_tokenize(tweet) for tweet in cleaned_tweets]
+
+    # flatten_list
+    tokens = list(functools.reduce(operator.concat, tokens))
+
+    logger.debug("Find Bigrams")
+    bigram_finder = nltk.collocations.BigramCollocationFinder.from_words(tokens)
+    bigram_freq = list(bigram_finder.ngram_fd.items())
+
+    logger.info("Start Filtering Bigrams TODO: Change threshold to env Variable.")
+    return [
+        NGram(
+            dimension=3,
+            q=q,
+            frequency=bigram[1],
+            sequence=list(bigram[0]),
+            type=type
+        ) for bigram in bigram_freq
+        if right_types_3_gram(bigram[0]) and bigram[1] > 3      # TODO change to env Variable
+    ]
+
+
 def get_hashtags_from_tweets(tweets: List[Tweet]) -> List[str]:
     logger.info("Getting Hashtags from Corpus")
     hashtag_list = [entity.hashtags for entity in tweets if entity.hashtags != []]
@@ -302,8 +341,10 @@ def get_hashtags_from_tweets(tweets: List[Tweet]) -> List[str]:
 def ngram_runner(tweets: List[Tweet], q: str, type: str):
     tweet_bodies = [tweet.text for tweet in tweets]
     bigrams = get_2_gram_df(tweet_bodies, q=q, type=type)
+    trigrams = get_3_gram_df(tweet_bodies, q=q, type=type)
     ORM.remove_ngrams(dimension=2, q=q, type=type)
-    ORM.insert_ngrams(bigrams)
+    ORM.remove_ngrams(dimension=3, q=q, type=type)
+    ORM.insert_ngrams(bigrams + trigrams)
 
 
 def runner(sync_job: SyncJob):
@@ -371,7 +412,9 @@ def event_listener():
 
 
 if __name__ == "__main__":
-    while True:
+    _initial_runner()
+
+    while False:
         try:
             event_listener()
         except Exception as e:
