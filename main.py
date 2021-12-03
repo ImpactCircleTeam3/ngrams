@@ -307,20 +307,20 @@ def get_3_gram_df(corpus: List[str], q: str, type: str) -> List[NGram]:
     # flatten_list
     tokens = list(functools.reduce(operator.concat, tokens))
 
-    logger.debug("Find Bigrams")
-    bigram_finder = nltk.collocations.BigramCollocationFinder.from_words(tokens)
-    bigram_freq = list(bigram_finder.ngram_fd.items())
+    logger.debug("Find Trigrams")
+    trigram_finder = nltk.collocations.TrigramCollocationFinder.from_words(tokens)
+    trigram_freq = list(trigram_finder.ngram_fd.items())
 
     logger.info("Start Filtering Bigrams TODO: Change threshold to env Variable.")
     return [
         NGram(
             dimension=3,
             q=q,
-            frequency=bigram[1],
-            sequence=list(bigram[0]),
+            frequency=trigram[1],
+            sequence=list(trigram[0]),
             type=type
-        ) for bigram in bigram_freq
-        if right_types_3_gram(bigram[0]) and bigram[1] > 3      # TODO change to env Variable
+        ) for trigram in trigram_freq
+        if right_types_3_gram(trigram[0]) and trigram[1] > 3      # TODO change to env Variable
     ]
 
 
