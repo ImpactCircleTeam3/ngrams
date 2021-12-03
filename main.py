@@ -59,7 +59,7 @@ class Settings:
         return {
             "bootstrap.servers": os.getenv("KAFKA_CLUSTER_SERVER"),
             "group.id": f"ngrams-{uuid.uuid4().hex[:6]}",
-            'auto.offset.reset': 'earliest',
+            'auto.offset.reset': 'latest',
             'security.protocol': 'SASL_SSL',
             'sasl.mechanisms': 'PLAIN',
             'sasl.username': os.getenv("KAFKA_CLUSTER_API_KEY"),
@@ -310,6 +310,11 @@ def runner(sync_job: SyncJob):
     hashtag = sync_job.q
     logger.info(f"Start creating ngrams for hashtag {hashtag} and all references")
     tweets = ORM.fetch_tweets_bodies_by_hashtag(hashtag)
+
+    if len(tweets) == 0:
+        logger.warning(f"No Tweets for hashtag {hashtag}")
+        return
+
     hashtags_in_tweets = get_hashtags_from_tweets(tweets)
     logger.info(f"{len(hashtag) - 1} references found")
     if len(tweets) >= 50:
