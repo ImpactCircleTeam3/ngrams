@@ -412,9 +412,7 @@ def event_listener():
 
 
 if __name__ == "__main__":
-    _initial_runner()
-
-    while False:
+    while True:
         try:
             event_listener()
         except Exception as e:
