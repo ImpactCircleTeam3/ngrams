@@ -348,6 +348,7 @@ def ngram_runner(tweets: List[Tweet], q: str, type: str):
 
 
 def runner(sync_job: SyncJob):
+    return
     hashtag = sync_job.q
     logger.info(f"Start creating ngrams for hashtag {hashtag} and all references")
     tweets = ORM.fetch_tweets_bodies_by_hashtag(hashtag)
