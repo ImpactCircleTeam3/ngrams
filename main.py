@@ -12,7 +12,9 @@ import uuid
 import avro.schema
 from avro.io import DatumReader, BinaryDecoder
 from time import sleep
-from typing import List, Optional
+from typing import List, Optional, Callable
+from neo4j import GraphDatabase
+from neo4j.work.transaction import Transaction
 from psycopg2.extras import execute_values
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
@@ -66,6 +68,14 @@ class Settings:
             'sasl.password': os.getenv("KAFKA_CLUSTER_API_SECRET")
         }
 
+    @staticmethod
+    def get_neo4j_kwargs() -> dict:
+        return {
+            "user": os.getenv("NEO4J_USER"),
+            "password": os.getenv("NEO4J_PASSWORD"),
+            "uri": os.getenv("NEO4J_URI")
+        }
+
 
 @dataclass
 class Tweet:
@@ -100,6 +110,32 @@ class SyncJob:
     timestamp: datetime
     q: str
     type: str
+
+
+class Neo4J:
+    Neo4J: Optional["Neo4J"] = None
+
+    @classmethod
+    def get_instance(cls) -> "Neo4J":
+        if not cls.Neo4J:
+            cls.Neo4J = cls()
+        return cls.Neo4J
+
+    def __init__(self):
+        self._connect()
+
+    def _connect(self):
+        neo4j_kwargs = Settings.get_neo4j_kwargs()
+        self.driver = GraphDatabase.driver(
+            neo4j_kwargs["uri"],
+            auth=(neo4j_kwargs["user"], neo4j_kwargs["password"])
+        )
+
+    @classmethod
+    def exec(cls, executable: Callable, **kwargs):
+        neo4j = cls.get_instance().Neo4J
+        with neo4j.driver.session() as session:
+            return session.write_transaction(executable, **kwargs)
 
 
 class DB:
@@ -183,11 +219,11 @@ class ORM:
         # TODO improve Range
         for i in range(1, 9):
             sql = f"SELECT {','.join(Tweet.__annotations__.keys())} FROM tweet WHERE hashtags[%s]=%s AND language_code=%s"
+            cls.db.cur.execute(sql, (i, hashtag, "en",))
             try:
                 tweets += [Tweet(*row) for row in cls.db.cur.fetchall()]
             except psycopg2.ProgrammingError as e:
                 logger.warning(str(e))
-            cls.db.cur.execute(sql, (i, hashtag, "en", ))
         unique_tweets = cls._clean_tweets(tweets)
         logger.info(f"Number of fetched tweets: {len(unique_tweets)}")
         return unique_tweets
@@ -226,6 +262,43 @@ class ORM:
         cls.db.cur.execute(sql)
         return [e[0] for e in cls.db.cur.fetchall()]
 
+    @classmethod
+    def get_direct_related_tweets_by_hashtag_from_neo4j(cls, tx: Transaction, hashtags: List[str]) -> List[str]:
+        logger.info(f"Fetch tweets from neo for hashtag list with length {len(hashtags)}")
+        where_params_lol = [f"h.hashtag='{hashtag}'" for hashtag in hashtags]
+        query = f"""
+            MATCH (h:Hashtag)-->(t:Tweet)
+            WHERE {" OR ".join(where_params_lol)}
+            WITH DISTINCT t as t_
+            RETURN t_.text
+        """
+        result = tx.run(query)
+        results = [e["t_.text"] for e in result]
+        logger.info(f"No of fetched tweets: {len(results)}")
+        return results
+
+    @classmethod
+    def get_related_hashtag_list_by_hashtag_from_neo4j(cls, tx: Transaction, hashtags: List[str]) -> List[str]:
+        logger.info(f"Fetch related hashtags from neo for hashtag list with length {len(hashtags)}")
+        where_params_lol = [f"h0.hashtag='{hashtag}'" for hashtag in hashtags]
+        query = f"""
+            MATCH (h0:Hashtag)-->(t:Tweet)<--(h:Hashtag)
+            WHERE {" OR ".join(where_params_lol)}
+            WITH DISTINCT h AS unique_h, COUNT(t) AS tweet_count
+            WHERE tweet_count > 5
+            RETURN unique_h.hashtag
+        """
+        result = tx.run(query)
+        results = list(set([e["unique_h.hashtag"] for e in result] + hashtags))
+        logger.info(f"No of fetched hashtags: {len(results)}")
+        return results
+
+    @classmethod
+    def ngram_is_pure_hashtag(cls, hashtags: List[str]):
+        sql = "SELECT COUNT(*) FROM hashtag WHERE hashtag IN %s"
+        cls.db.cur.execute(sql, (hashtags,))
+        matches = cls.db.cur.fetchone()[0]
+        return matches == hashtags
 
 def _clean_text(text: str):
     # remove and replace all urls
@@ -320,7 +393,7 @@ def get_3_gram_df(corpus: List[str], q: str, type: str) -> List[NGram]:
             sequence=list(trigram[0]),
             type=type
         ) for trigram in trigram_freq
-        if right_types_3_gram(trigram[0]) and trigram[1] > 3      # TODO change to env Variable
+        if right_types_3_gram(trigram[0]) and trigram[1] > 3 and not ORM.ngram_is_pure_hashtag(trigram[0])      # TODO change to env Variable
     ]
 
 
@@ -347,8 +420,7 @@ def ngram_runner(tweets: List[Tweet], q: str, type: str):
     ORM.insert_ngrams(bigrams + trigrams)
 
 
-def runner(sync_job: SyncJob):
-    return
+def hashtag_job_runner(sync_job: SyncJob):
     hashtag = sync_job.q
     logger.info(f"Start creating ngrams for hashtag {hashtag} and all references")
     tweets = ORM.fetch_tweets_bodies_by_hashtag(hashtag)
@@ -373,6 +445,37 @@ def runner(sync_job: SyncJob):
             ngram_runner(tweets, q=hashtag_, type="hashtag")
         else:
             logger.info(f"Not enough text bodies for creating valuable ngrams ({len(tweets)})")
+
+
+def bubble_job_runner(sync_job: SyncJob):
+    # TODO Optimize code - too many duplicates!
+
+    hashtags = sync_job.q.split(",")
+    logger.info(f"Start creating ngrams for bubble with hashtags {sync_job.q} and all references")
+
+    q = f"DIRECT {sync_job.q}"
+    logger.info("Start Process for direct related tweets for Hashtag list")
+    tweets = Neo4J.exec(ORM.get_direct_related_tweets_by_hashtag_from_neo4j, hashtags=hashtags)
+    trigrams = get_3_gram_df(tweets, q=q, type=sync_job.type)
+    ORM.remove_ngrams(dimension=3, q=q, type=sync_job.type)
+    ORM.insert_ngrams(trigrams)
+
+    logger.info("Start Process for indirect related tweets for Hashtag list")
+    related_hashtags = Neo4J.exec(ORM.get_related_hashtag_list_by_hashtag_from_neo4j, hashtags=hashtags)
+    q = f"RELATED {sync_job.q}"
+    tweets = Neo4J.exec(ORM.get_direct_related_tweets_by_hashtag_from_neo4j, hashtags=related_hashtags)
+    trigrams = get_3_gram_df(tweets, q=q, type=sync_job.type)
+    ORM.remove_ngrams(dimension=3, q=q, type=sync_job.type)
+    ORM.insert_ngrams(trigrams)
+
+
+def runner(sync_job: SyncJob):
+    if sync_job.type == "hashtag":
+        return hashtag_job_runner(sync_job)
+    elif sync_job.type == "bubble":
+        return bubble_job_runner(sync_job)
+    else:
+        return
 
 
 def _initial_runner():
