@@ -454,7 +454,8 @@ def hashtag_job_runner(sync_job: SyncJob):
     relevant_hashtags = Neo4J.exec(ORM.get_relevant_hashtags_from_hashtag_list_neo4j, root_hashtag=hashtag)
 
     # Referenced Hashtags
-    for hashtag_ in relevant_hashtags:
+    for i, hashtag_ in enumerate(relevant_hashtags):
+        logger.info(f"Related hashtag {hashtag_} - {i + 1} / {len(relevant_hashtags)}")
         if hashtag_ == hashtag:
             continue
         tweets = ORM.fetch_tweets_bodies_by_hashtag(hashtag_)
