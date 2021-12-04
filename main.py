@@ -298,7 +298,7 @@ class ORM:
         sql = "SELECT COUNT(*) FROM hashtag WHERE hashtag IN %s"
         cls.db.cur.execute(sql, (hashtags,))
         matches = cls.db.cur.fetchone()[0]
-        return matches == hashtags
+        return matches == len(hashtags)
 
     @classmethod
     def get_relevant_hashtags_from_hashtag_list_neo4j(cls, tx: Transaction, root_hashtag: str):
