@@ -300,6 +300,23 @@ class ORM:
         matches = cls.db.cur.fetchone()[0]
         return matches == hashtags
 
+    @classmethod
+    def get_relevant_hashtags_from_hashtag_list_neo4j(cls, tx: Transaction, root_hashtag: str):
+        logger.info(f"Start fetching relevant hashtags from neo4j for {root_hashtag}")
+        query = """
+            MATCH (h0:Hashtag)-->(t:Tweet)<--(h:Hashtag)
+            WITH  h, h0, count((h0)-->(t)) as match_count
+            WHERE h0.hashtag=$hashtag
+            RETURN h.hashtag
+            ORDER BY match_count DESC
+            LIMIT 25
+        """
+        result = tx.run(query, hashtag=root_hashtag)
+        results = [e["h.hashtag"] for e in result]
+        logger.info(f"Fetching relevant hashtag done. Found {len(results)} hashtags")
+        return results
+
+
 def _clean_text(text: str):
     # remove and replace all urls
     text = re.sub(r'http\S+', ' ', text)
@@ -429,15 +446,15 @@ def hashtag_job_runner(sync_job: SyncJob):
         logger.warning(f"No Tweets for hashtag {hashtag}")
         return
 
-    hashtags_in_tweets = get_hashtags_from_tweets(tweets)
-    logger.info(f"{len(hashtag) - 1} references found")
     if len(tweets) >= 50:
         ngram_runner(tweets, q=hashtag, type="hashtag")
     else:
         logger.info(f"Not enough text bodies for creating valuable ngrams ({len(tweets)})")
 
+    relevant_hashtags = Neo4J.exec(ORM.get_relevant_hashtags_from_hashtag_list_neo4j, root_hashtag=hashtag)
+
     # Referenced Hashtags
-    for hashtag_ in hashtags_in_tweets:
+    for hashtag_ in relevant_hashtags:
         if hashtag_ == hashtag:
             continue
         tweets = ORM.fetch_tweets_bodies_by_hashtag(hashtag_)
